@@ -18,7 +18,7 @@ from tqdm import tqdm
 from s4dd.s4_for_denovo_design import S4forDenovoDesign
 
 
-MAX_GEN_PER_CALL = 1000  # safety cap to avoid oversized single-call sampling
+MAX_GEN_PER_CALL = 10  # safety cap to avoid oversized single-call sampling
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num",
         type=int,
-        default=5000,
+        default=100,
         help="Number of molecules to generate (default: 5000).",
     )
     parser.add_argument(
