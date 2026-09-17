@@ -9,12 +9,14 @@ cubic_graph.py - 三维分子性质分布图绘制脚本
 - 将毒性标签 toxicity 映射为 IC50 代表值作为 z 轴；
 - 使用 toxicity 控制散点颜色；
 - 读取筛选后候选分子文件 mol-filtered；
-- 根据 mol-filtered 中的 SMILES 在完整分子列表中匹配候选分子；
+- 使用 RDKit canonical SMILES 在完整分子列表中匹配候选分子；
 - 将筛选通过的候选分子以星号标记。
+- 独立读取并以菱形标注实验验证分子。
 
 输入：
 1. --mol-processed：完整分子列表，必须包含 smiles、toxicity、aureus_MIC、ecoli_MIC；
 2. --mol-filtered：筛选通过的分子列表，至少包含 smiles。
+3. --mol-validated：实验验证分子列表，至少包含 label、smiles。
 
 输出：
 - molecules_3d_scatter.png
@@ -28,6 +30,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from matplotlib.lines import Line2D
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+from rdkit import Chem
 
 plt.rcParams["font.family"] = "sans-serif"
 plt.rcParams["font.sans-serif"] = ["SimHei", "DejaVu Sans", "Arial"]
@@ -56,6 +59,8 @@ SIZE_CIRCLE = 12
 SIZE_STAR = 60
 ALPHA_CIRCLE = 0.6
 ALPHA_STAR = 0.95
+VALIDATED_COLOR = "#8e44ad"
+SIZE_VALIDATED = 100
 
 ELEV = 22
 AZIM = -65
@@ -81,6 +86,63 @@ def read_clean(path: Path) -> pd.DataFrame:
     return df
 
 
+def canonicalize_smiles(smiles):
+    """返回 RDKit canonical SMILES；非法或空 SMILES 返回 None。"""
+    try:
+        mol = Chem.MolFromSmiles(str(smiles).strip())
+        if mol is None:
+            return None
+        return Chem.MolToSmiles(mol, canonical=True)
+    except Exception:
+        return None
+
+
+def build_validated_map(mol_validated: pd.DataFrame) -> dict:
+    """建立 canonical SMILES -> label 映射，同结构多标签时保留第一条。"""
+    validated_map = {}
+    for _, row in mol_validated.iterrows():
+        canonical = row["canonical_smiles"]
+        if canonical is None or pd.isna(canonical):
+            print(f"WARNING: validated molecule '{row['label']}' has an invalid SMILES")
+            continue
+
+        label = str(row["label"]).strip()
+        if canonical in validated_map:
+            if label != validated_map[canonical]:
+                print(
+                    "WARNING: multiple validated labels refer to the same structure; "
+                    f"keeping '{validated_map[canonical]}' and ignoring '{label}'"
+                )
+            continue
+        validated_map[canonical] = label
+    return validated_map
+
+
+def warn_unplotted_validated(
+    validated_map: dict,
+    mol_processed: pd.DataFrame,
+    coordinate_ready_df: pd.DataFrame,
+    plot_df: pd.DataFrame,
+) -> None:
+    """逐个报告未匹配、缺少坐标数据或被坐标范围排除的验证分子。"""
+    processed_structures = set(mol_processed["canonical_smiles"].dropna())
+    coordinate_ready_structures = set(coordinate_ready_df["canonical_smiles"].dropna())
+    plotted_structures = set(plot_df["canonical_smiles"].dropna())
+
+    for canonical, label in validated_map.items():
+        if canonical not in processed_structures:
+            print(f"WARNING: validated molecule '{label}' was not found in mol_processed")
+        elif canonical not in coordinate_ready_structures:
+            print(
+                f"WARNING: validated molecule '{label}' was matched but excluded "
+                "because required MIC/toxicity coordinates are missing"
+            )
+        elif canonical not in plotted_structures:
+            print(
+                f"WARNING: validated molecule '{label}' was matched but excluded by plot range"
+            )
+
+
 def main():
     parser = argparse.ArgumentParser(description="绘制分子三维散点图")
     parser.add_argument(
@@ -95,14 +157,22 @@ def main():
         default="molecules_final.csv",
         help="筛选通过的分子 CSV 文件路径，用于标星",
     )
+    parser.add_argument(
+        "--mol-validated",
+        type=str,
+        default="validated_molecules.csv",
+        help="实验验证分子 CSV 文件路径，用于单独突出显示和标注",
+    )
     args = parser.parse_args()
 
     base = DATA_DIR
     processed_path = Path(args.mol_processed)
     filtered_path = Path(args.mol_filtered)
+    validated_path = Path(args.mol_validated)
 
     mol_processed = read_clean(processed_path)
     mol_filtered = read_clean(filtered_path)
+    mol_validated = read_clean(validated_path)
 
     required_processed_columns = ["smiles", "toxicity", "aureus_MIC", "ecoli_MIC"]
     missing_processed = [c for c in required_processed_columns if c not in mol_processed.columns]
@@ -112,10 +182,19 @@ def main():
     if "smiles" not in mol_filtered.columns:
         raise ValueError("mol-filtered 文件缺少必要列: ['smiles']")
 
-    candidate_set = set(mol_filtered["smiles"].astype(str).str.strip())
-    mol_processed["is_candidate"] = (
-        mol_processed["smiles"].astype(str).str.strip().isin(candidate_set)
-    )
+    missing_validated = [c for c in ["label", "smiles"] if c not in mol_validated.columns]
+    if missing_validated:
+        raise ValueError(f"mol-validated 文件缺少必要列: {missing_validated}")
+
+    for df in [mol_processed, mol_filtered, mol_validated]:
+        df["canonical_smiles"] = df["smiles"].apply(canonicalize_smiles)
+
+    candidate_set = set(mol_filtered["canonical_smiles"].dropna())
+    mol_processed["is_candidate"] = mol_processed["canonical_smiles"].isin(candidate_set)
+
+    validated_map = build_validated_map(mol_validated)
+    mol_processed["is_validated"] = mol_processed["canonical_smiles"].isin(validated_map)
+    mol_processed["validated_label"] = mol_processed["canonical_smiles"].map(validated_map)
 
     for col in ["aureus_MIC", "ecoli_MIC"]:
         mol_processed[col] = pd.to_numeric(mol_processed[col], errors="coerce")
@@ -124,17 +203,19 @@ def main():
     mol_processed["IC50_z"] = mol_processed["toxicity"].map(TOX_TO_Z)
 
     must_cols = ["aureus_MIC", "ecoli_MIC", "IC50_z"]
-    plot_df = mol_processed.dropna(subset=must_cols).copy()
+    coordinate_ready_df = mol_processed.dropna(subset=must_cols).copy()
 
     x0, x1 = X_LIM
     y0, y1 = Y_LIM
     z0, z1 = Z_LIM
     in_range = (
-        plot_df["aureus_MIC"].between(x0, x1)
-        & plot_df["ecoli_MIC"].between(y0, y1)
-        & plot_df["IC50_z"].between(z0, z1)
+        coordinate_ready_df["aureus_MIC"].between(x0, x1)
+        & coordinate_ready_df["ecoli_MIC"].between(y0, y1)
+        & coordinate_ready_df["IC50_z"].between(z0, z1)
     )
-    plot_df = plot_df.loc[in_range].copy()
+    plot_df = coordinate_ready_df.loc[in_range].copy()
+
+    warn_unplotted_validated(validated_map, mol_processed, coordinate_ready_df, plot_df)
 
     plt.close("all")
     fig = plt.figure(figsize=FIGSIZE, dpi=DPI)
@@ -153,7 +234,7 @@ def main():
         if sub.empty:
             continue
 
-        sub_nc = sub[~sub["is_candidate"]]
+        sub_nc = sub[~sub["is_candidate"] & ~sub["is_validated"]]
         if not sub_nc.empty:
             ax.scatter(
                 sub_nc["aureus_MIC"].values,
@@ -166,7 +247,7 @@ def main():
                 alpha=ALPHA_CIRCLE,
             )
 
-        sub_c = sub[sub["is_candidate"]]
+        sub_c = sub[sub["is_candidate"] & ~sub["is_validated"]]
         if not sub_c.empty:
             ax.scatter(
                 sub_c["aureus_MIC"].values,
@@ -178,6 +259,29 @@ def main():
                 linewidths=0.3,
                 c=color,
                 alpha=ALPHA_STAR,
+            )
+
+    validated = plot_df[plot_df["is_validated"]]
+    if not validated.empty:
+        ax.scatter(
+            validated["aureus_MIC"].values,
+            validated["ecoli_MIC"].values,
+            validated["IC50_z"].values,
+            marker="D",
+            s=SIZE_VALIDATED,
+            edgecolors="black",
+            linewidths=1.0,
+            c=VALIDATED_COLOR,
+            alpha=1.0,
+        )
+        for _, row in validated.iterrows():
+            ax.text(
+                row["aureus_MIC"] + 1.0,
+                row["ecoli_MIC"] + 1.0,
+                row["IC50_z"] + 3.0,
+                str(row["validated_label"]),
+                fontsize=9,
+                color="black",
             )
 
     color_handles = [
@@ -215,12 +319,22 @@ def main():
             markersize=10,
             label="候选（星标）",
         ),
+        Line2D(
+            [0],
+            [0],
+            marker="D",
+            linestyle="",
+            markerfacecolor=VALIDATED_COLOR,
+            markeredgecolor="black",
+            markersize=8,
+            label="实验验证分子",
+        ),
     ]
     handles = color_handles + shape_handles
 
     ax.legend(
         handles=handles,
-        title="图例：颜色=毒性；形状=是否候选",
+        title="图例：颜色=毒性；★=计算候选；◆=实验验证分子",
         loc="upper left",
         bbox_to_anchor=(1.00, 1.02),
         frameon=True,
@@ -247,9 +361,14 @@ def main():
         {
             "mol_processed": str(processed_path),
             "mol_filtered": str(filtered_path),
+            "mol_validated": str(validated_path),
             "total_processed_rows": int(len(mol_processed)),
             "filtered_smiles": int(len(candidate_set)),
             "matched_candidates_before_range_filter": matched_before_range,
+            "validated_input_rows": int(len(mol_validated)),
+            "validated_unique_structures": int(len(validated_map)),
+            "matched_validated_rows": int(mol_processed["is_validated"].sum()),
+            "validated_rows_in_plot": int(plot_df["is_validated"].sum()),
             "total_points_plotted": int(len(plot_df)),
             "candidates_plotted": int(plot_df["is_candidate"].sum()),
             "non_candidates_plotted": int((~plot_df["is_candidate"]).sum()),

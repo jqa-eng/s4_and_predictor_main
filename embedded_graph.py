@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 embedded_graph.py
-二维嵌入图（UMAP/t-SNE）+ SI 着色 + 候选星标
+二维嵌入图（UMAP/t-SNE）+ SI 着色 + 候选星标 + 实验验证分子标注
 
 输入：
 - --mol-processed: 完整分子列表（用于计算嵌入与绘制全部散点）
 - --mol-filtered: 筛选通过分子列表（仅用于决定哪些分子标星）
+- --mol-validated: 实验验证分子列表（独立匹配、绘制并标注）
 
 输出：
 - molecules_2d_embedding.png
@@ -20,6 +21,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
+from rdkit import Chem
 
 # ---------------------- 可调参数 ----------------------
 DATA_DIR = Path(".")
@@ -43,6 +45,8 @@ POINT_SIZE = 10
 STAR_SIZE = 35
 ALPHA_OTHER = 0.8
 ALPHA_STAR = 0.75
+VALIDATED_COLOR = "#8e44ad"
+VALIDATED_SIZE = 90
 
 FIGSIZE = (10, 8)
 DPI = 180
@@ -63,6 +67,64 @@ def read_clean(path: Path) -> pd.DataFrame:
     if "smiles" in df.columns:
         df["smiles"] = df["smiles"].astype(str).str.strip().str.strip('"').str.strip("'")
     return df
+
+
+def canonicalize_smiles(smiles):
+    """返回 RDKit canonical SMILES；非法或空 SMILES 返回 None。"""
+    try:
+        mol = Chem.MolFromSmiles(str(smiles).strip())
+        if mol is None:
+            return None
+        return Chem.MolToSmiles(mol, canonical=True)
+    except Exception:
+        return None
+
+
+def build_validated_map(mol_validated: pd.DataFrame) -> dict:
+    """建立 canonical SMILES -> label 映射，同结构多标签时保留第一条。"""
+    validated_map = {}
+    for _, row in mol_validated.iterrows():
+        canonical = row["canonical_smiles"]
+        if canonical is None or pd.isna(canonical):
+            print(f"WARNING: validated molecule '{row['label']}' has an invalid SMILES")
+            continue
+
+        label = str(row["label"]).strip()
+        if canonical in validated_map:
+            if label != validated_map[canonical]:
+                print(
+                    "WARNING: multiple validated labels refer to the same structure; "
+                    f"keeping '{validated_map[canonical]}' and ignoring '{label}'"
+                )
+            continue
+        validated_map[canonical] = label
+    return validated_map
+
+
+def warn_unplotted_validated(
+    validated_map: dict,
+    mol_processed: pd.DataFrame,
+    plot_df: pd.DataFrame,
+    embedded_df: pd.DataFrame,
+) -> None:
+    """逐个报告未匹配或未进入最终二维图的验证分子。"""
+    processed_structures = set(mol_processed["canonical_smiles"].dropna())
+    plot_ready_structures = set(plot_df["canonical_smiles"].dropna())
+    embedded_structures = set(embedded_df["canonical_smiles"].dropna())
+
+    for canonical, label in validated_map.items():
+        if canonical not in processed_structures:
+            print(f"WARNING: validated molecule '{label}' was not found in mol_processed")
+        elif canonical not in plot_ready_structures:
+            print(
+                f"WARNING: validated molecule '{label}' was matched but excluded "
+                "because required MIC/toxicity data are missing"
+            )
+        elif canonical not in embedded_structures:
+            print(
+                f"WARNING: validated molecule '{label}' was matched but did not receive "
+                "final embedding coordinates"
+            )
 
 
 def safe_div(num: pd.Series, den: pd.Series) -> pd.Series:
@@ -86,7 +148,7 @@ def classify(si_sa: float, si_ec: float) -> str:
 
 def compute_embedding(plot_df: pd.DataFrame):
     try:
-        from rdkit import Chem, DataStructs
+        from rdkit import DataStructs
         from rdkit.Chem import AllChem
 
         def morgan_fp(smiles: str, n_bits=2048, radius=2):
@@ -170,13 +232,21 @@ def main():
         default=100,
         help="仅对 mol-filtered 中优先级最高的前 N 个分子标星；<=0 表示全部标星",
     )
+    parser.add_argument(
+        "--mol-validated",
+        type=str,
+        default="validated_molecules.csv",
+        help="实验验证分子 CSV 文件路径，用于单独突出显示和标注",
+    )
     args = parser.parse_args()
 
     processed_path = Path(args.mol_processed)
     filtered_path = Path(args.mol_filtered)
+    validated_path = Path(args.mol_validated)
 
     mol_processed = read_clean(processed_path)
     mol_filtered = read_clean(filtered_path)
+    mol_validated = read_clean(validated_path)
 
     required_processed_columns = ["smiles", "toxicity", "aureus_MIC", "ecoli_MIC"]
     missing_processed = [c for c in required_processed_columns if c not in mol_processed.columns]
@@ -185,6 +255,13 @@ def main():
 
     if "smiles" not in mol_filtered.columns:
         raise ValueError("mol-filtered 文件缺少必要列: ['smiles']")
+
+    missing_validated = [c for c in ["label", "smiles"] if c not in mol_validated.columns]
+    if missing_validated:
+        raise ValueError(f"mol-validated 文件缺少必要列: {missing_validated}")
+
+    for df in [mol_processed, mol_filtered, mol_validated]:
+        df["canonical_smiles"] = df["smiles"].apply(canonicalize_smiles)
 
     filtered_smiles_series = mol_filtered["smiles"].astype(str).str.strip()
     filtered_df = mol_filtered.copy()
@@ -198,14 +275,20 @@ def main():
         if "aureus_MIC" in filtered_df.columns:
             filtered_df["aureus_MIC"] = pd.to_numeric(filtered_df["aureus_MIC"], errors="coerce")
             filtered_df = filtered_df.sort_values(by="aureus_MIC", ascending=True, na_position="last")
-            star_smiles = filtered_df["smiles"].head(args.star_top_n)
+            star_canonical_smiles = filtered_df["canonical_smiles"].head(args.star_top_n)
         else:
-            star_smiles = filtered_df["smiles"].head(args.star_top_n)
+            star_canonical_smiles = filtered_df["canonical_smiles"].head(args.star_top_n)
     else:
-        star_smiles = filtered_df["smiles"]
+        star_canonical_smiles = filtered_df["canonical_smiles"]
 
-    candidate_set = set(star_smiles.astype(str).str.strip())
-    mol_processed["is_star"] = mol_processed["smiles"].astype(str).str.strip().isin(candidate_set)
+    candidate_set = set(filtered_df["canonical_smiles"].dropna())
+    star_set = set(star_canonical_smiles.dropna())
+    mol_processed["is_candidate"] = mol_processed["canonical_smiles"].isin(candidate_set)
+    mol_processed["is_star"] = mol_processed["canonical_smiles"].isin(star_set)
+
+    validated_map = build_validated_map(mol_validated)
+    mol_processed["is_validated"] = mol_processed["canonical_smiles"].isin(validated_map)
+    mol_processed["validated_label"] = mol_processed["canonical_smiles"].map(validated_map)
 
     mol_processed["toxicity"] = mol_processed["toxicity"].astype(str).str.strip()
     for col in ["aureus_MIC", "ecoli_MIC"]:
@@ -225,12 +308,17 @@ def main():
     plot_df["cls"] = [classify(a, b) for a, b in zip(plot_df["SI_SA"], plot_df["SI_EC"])]
 
     embedded_df = compute_embedding(plot_df)
+    warn_unplotted_validated(validated_map, mol_processed, plot_df, embedded_df)
 
     plt.close("all")
     fig, ax = plt.subplots(figsize=FIGSIZE, dpi=DPI)
 
     for key, color in COLOR_MAP.items():
-        sub = embedded_df[(embedded_df["cls"] == key) & (~embedded_df["is_star"])]
+        sub = embedded_df[
+            (embedded_df["cls"] == key)
+            & (~embedded_df["is_star"])
+            & (~embedded_df["is_validated"])
+        ]
         if len(sub) == 0:
             continue
         ax.scatter(
@@ -243,7 +331,7 @@ def main():
             label=None,
         )
 
-    star = embedded_df[embedded_df["is_star"]]
+    star = embedded_df[embedded_df["is_star"] & ~embedded_df["is_validated"]]
     if len(star) > 0:
         ax.scatter(
             star["x"],
@@ -256,6 +344,31 @@ def main():
             alpha=ALPHA_STAR,
             label=None,
         )
+
+    validated = embedded_df[embedded_df["is_validated"]]
+    if len(validated) > 0:
+        ax.scatter(
+            validated["x"],
+            validated["y"],
+            s=VALIDATED_SIZE,
+            marker="D",
+            c=VALIDATED_COLOR,
+            edgecolors="black",
+            linewidths=1.0,
+            alpha=1.0,
+            zorder=10,
+            label=None,
+        )
+        for _, row in validated.iterrows():
+            ax.annotate(
+                str(row["validated_label"]),
+                (row["x"], row["y"]),
+                xytext=(6, 6),
+                textcoords="offset points",
+                fontsize=9,
+                color="black",
+                zorder=11,
+            )
 
     ax.set_xticks([])
     ax.set_yticks([])
@@ -324,12 +437,22 @@ def main():
             markeredgecolor="k",
             markersize=10,
             label="候选（星标）",
-        )
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="D",
+            linestyle="",
+            markerfacecolor=VALIDATED_COLOR,
+            markeredgecolor="black",
+            markersize=8,
+            label="实验验证分子",
+        ),
     ]
     handles = color_handles + shape_handles
     legend = ax.legend(
         handles=handles,
-        title="图例：颜色=SI 等级；形状=候选星标",
+        title="图例：颜色=SI 等级；★=计算候选；◆=实验验证分子",
         loc="upper left",
         bbox_to_anchor=(0.02, 0.98),
         frameon=True,
@@ -346,6 +469,7 @@ def main():
 
     desired_columns = [
         "smiles",
+        "canonical_smiles",
         "toxicity",
         "aureus_MIC",
         "ecoli_MIC",
@@ -353,7 +477,10 @@ def main():
         "SI_SA",
         "SI_EC",
         "cls",
+        "is_candidate",
         "is_star",
+        "is_validated",
+        "validated_label",
         "x",
         "y",
     ]
@@ -366,11 +493,16 @@ def main():
         {
             "mol_processed": str(processed_path),
             "mol_filtered": str(filtered_path),
+            "mol_validated": str(validated_path),
             "total_processed_rows": int(len(mol_processed)),
             "filtered_smiles": int(len(candidate_set)),
             "star_top_n": int(args.star_top_n),
-            "star_smiles_used": int(len(candidate_set)),
+            "star_smiles_used": int(len(star_set)),
             "matched_star_rows": int(mol_processed["is_star"].sum()),
+            "validated_input_rows": int(len(mol_validated)),
+            "validated_unique_structures": int(len(validated_map)),
+            "matched_validated_rows": int(mol_processed["is_validated"].sum()),
+            "validated_rows_in_plot": int(embedded_df["is_validated"].sum()),
             "embedded_rows": int(len(embedded_df)),
             "star_rows_in_plot": int(embedded_df["is_star"].sum()),
             "out_png": OUT_PNG,
