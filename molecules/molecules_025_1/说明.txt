@@ -1,2 +1,0 @@
-运行的指令：python genmol_v1_fixed.py --model-dir models_s4/025 --n 1500 --batch 100 --out molecules.csv --required-prefix "BrC1=CC=C(C=C1)C2=C(C(=O)N3CCC3)N=NN2"
-S4采样温度：2.0
