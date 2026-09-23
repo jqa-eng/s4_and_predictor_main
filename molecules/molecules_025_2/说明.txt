@@ -1,2 +1,0 @@
-运行指令：python genmol_v1_fixed.py --model-dir models_s4/025 --n 1500 --batch 100 --out molecules.csv --required-prefix "O=C(C1=C(N(CC2=CC=CC=C2)CC3=CC=CC=C3)NN=N1)"
-S4采样温度：2.0
