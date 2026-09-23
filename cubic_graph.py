@@ -8,24 +8,25 @@ cubic_graph.py - 三维分子性质分布图绘制脚本
 - 以 E.coli_MIC 为 y 轴；
 - 将毒性标签 toxicity 映射为 IC50 代表值作为 z 轴；
 - 使用 toxicity 控制散点颜色；
-- 读取筛选后候选分子文件 mol-filtered；
-- 使用 RDKit canonical SMILES 在完整分子列表中匹配候选分子；
-- 将筛选通过的候选分子以星号标记。
-- 独立读取并以菱形标注实验验证分子。
+- 保留全部分子的背景散点，不再标记筛选候选；
+- 从实验验证文件中只选取 336，使用 RDKit canonical SMILES 匹配；
+- 以菱形单独标注 336。
 
 输入：
 1. --mol-processed：完整分子列表，必须包含 smiles、toxicity、aureus_MIC、ecoli_MIC；
-2. --mol-filtered：筛选通过的分子列表，至少包含 smiles。
-3. --mol-validated：实验验证分子列表，至少包含 label、smiles。
+2. --mol-filtered：兼容旧命令的参数，现已忽略。
+3. --mol-validated：实验验证分子列表，至少包含 label、smiles，且包含 336。
 
 输出：
 - molecules_3d_scatter.png
 - molecules_3d_scatter.svg
+- molecules_3d_scatter.pdf
 """
 
 import argparse
 from pathlib import Path
 
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import pandas as pd
 from matplotlib.lines import Line2D
@@ -36,6 +37,7 @@ plt.rcParams["font.family"] = "sans-serif"
 plt.rcParams["font.sans-serif"] = ["SimHei", "DejaVu Sans", "Arial"]
 plt.rcParams["mathtext.fontset"] = "stix"
 plt.rcParams["axes.unicode_minus"] = False
+mpl.rcParams.update({"svg.fonttype": "none", "pdf.fonttype": 42})
 
 
 # =============== 参数区（按需修改）===============
@@ -56,9 +58,7 @@ TOX_TO_COLOR = {
 }
 
 SIZE_CIRCLE = 12
-SIZE_STAR = 60
 ALPHA_CIRCLE = 0.6
-ALPHA_STAR = 0.95
 VALIDATED_COLOR = "#8e44ad"
 SIZE_VALIDATED = 100
 
@@ -72,7 +72,8 @@ Y_LIM = (0, 100)
 
 OUT_PNG = "molecules_3d_scatter.png"
 OUT_SVG = "molecules_3d_scatter.svg"
-DPI = 180
+OUT_PDF = "molecules_3d_scatter.pdf"
+DPI = 300
 FIGSIZE = (10, 8)
 # ==============================================
 
@@ -154,8 +155,8 @@ def main():
     parser.add_argument(
         "--mol-filtered",
         type=str,
-        default="molecules_final.csv",
-        help="筛选通过的分子 CSV 文件路径，用于标星",
+        default=None,
+        help="兼容旧命令；不再读取或标记候选分子",
     )
     parser.add_argument(
         "--mol-validated",
@@ -167,11 +168,9 @@ def main():
 
     base = DATA_DIR
     processed_path = Path(args.mol_processed)
-    filtered_path = Path(args.mol_filtered)
     validated_path = Path(args.mol_validated)
 
     mol_processed = read_clean(processed_path)
-    mol_filtered = read_clean(filtered_path)
     mol_validated = read_clean(validated_path)
 
     required_processed_columns = ["smiles", "toxicity", "aureus_MIC", "ecoli_MIC"]
@@ -179,18 +178,18 @@ def main():
     if missing_processed:
         raise ValueError(f"mol-processed 文件缺少必要列: {missing_processed}")
 
-    if "smiles" not in mol_filtered.columns:
-        raise ValueError("mol-filtered 文件缺少必要列: ['smiles']")
-
     missing_validated = [c for c in ["label", "smiles"] if c not in mol_validated.columns]
     if missing_validated:
         raise ValueError(f"mol-validated 文件缺少必要列: {missing_validated}")
 
-    for df in [mol_processed, mol_filtered, mol_validated]:
-        df["canonical_smiles"] = df["smiles"].apply(canonicalize_smiles)
+    mol_validated = mol_validated.loc[
+        mol_validated["label"].astype(str).str.strip().eq("336")
+    ].copy()
+    if mol_validated.empty:
+        raise ValueError("mol-validated 文件中未找到标签为 336 的分子")
 
-    candidate_set = set(mol_filtered["canonical_smiles"].dropna())
-    mol_processed["is_candidate"] = mol_processed["canonical_smiles"].isin(candidate_set)
+    for df in [mol_processed, mol_validated]:
+        df["canonical_smiles"] = df["smiles"].apply(canonicalize_smiles)
 
     validated_map = build_validated_map(mol_validated)
     mol_processed["is_validated"] = mol_processed["canonical_smiles"].isin(validated_map)
@@ -219,7 +218,9 @@ def main():
 
     plt.close("all")
     fig = plt.figure(figsize=FIGSIZE, dpi=DPI)
-    ax = fig.add_subplot(111, projection="3d")
+    # Disable mplot3d's collection depth sorting so the 336 marker can stay
+    # above nearby background points regardless of the viewing angle.
+    ax = fig.add_subplot(111, projection="3d", computed_zorder=False)
 
     ax.view_init(elev=ELEV, azim=AZIM)
     ax.set_xlabel(r"MIC$_{S.\,aureus}$ ($\mu$g/mL)")
@@ -234,31 +235,18 @@ def main():
         if sub.empty:
             continue
 
-        sub_nc = sub[~sub["is_candidate"] & ~sub["is_validated"]]
-        if not sub_nc.empty:
+        background = sub[~sub["is_validated"]]
+        if not background.empty:
             ax.scatter(
-                sub_nc["aureus_MIC"].values,
-                sub_nc["ecoli_MIC"].values,
-                sub_nc["IC50_z"].values,
+                background["aureus_MIC"].values,
+                background["ecoli_MIC"].values,
+                background["IC50_z"].values,
                 marker="o",
                 s=SIZE_CIRCLE,
                 edgecolors="none",
                 c=color,
                 alpha=ALPHA_CIRCLE,
-            )
-
-        sub_c = sub[sub["is_candidate"] & ~sub["is_validated"]]
-        if not sub_c.empty:
-            ax.scatter(
-                sub_c["aureus_MIC"].values,
-                sub_c["ecoli_MIC"].values,
-                sub_c["IC50_z"].values,
-                marker="*",
-                s=SIZE_STAR,
-                edgecolors="k",
-                linewidths=0.3,
-                c=color,
-                alpha=ALPHA_STAR,
+                zorder=2,
             )
 
     validated = plot_df[plot_df["is_validated"]]
@@ -273,6 +261,8 @@ def main():
             linewidths=1.0,
             c=VALIDATED_COLOR,
             alpha=1.0,
+            depthshade=False,
+            zorder=10,
         )
         for _, row in validated.iterrows():
             ax.text(
@@ -282,6 +272,7 @@ def main():
                 str(row["validated_label"]),
                 fontsize=9,
                 color="black",
+                zorder=11,
             )
 
     color_handles = [
@@ -302,39 +293,19 @@ def main():
         Line2D(
             [0],
             [0],
-            marker="o",
-            linestyle="",
-            markerfacecolor="gray",
-            markeredgecolor="none",
-            markersize=6,
-            label="非候选",
-        ),
-        Line2D(
-            [0],
-            [0],
-            marker="*",
-            linestyle="",
-            markerfacecolor="gray",
-            markeredgecolor="k",
-            markersize=10,
-            label="候选（星标）",
-        ),
-        Line2D(
-            [0],
-            [0],
             marker="D",
             linestyle="",
             markerfacecolor=VALIDATED_COLOR,
             markeredgecolor="black",
             markersize=8,
-            label="实验验证分子",
+            label="336",
         ),
     ]
     handles = color_handles + shape_handles
 
     ax.legend(
         handles=handles,
-        title="图例：颜色=毒性；★=计算候选；◆=实验验证分子",
+        title="图例",
         loc="upper left",
         bbox_to_anchor=(1.00, 1.02),
         frameon=True,
@@ -355,26 +326,22 @@ def main():
     fig.tight_layout()
     fig.savefig(base / OUT_PNG, bbox_inches="tight", pad_inches=0.15)
     fig.savefig(base / OUT_SVG, bbox_inches="tight", pad_inches=0.15)
+    fig.savefig(base / OUT_PDF, bbox_inches="tight", pad_inches=0.15)
 
-    matched_before_range = int(mol_processed["is_candidate"].sum())
     print(
         {
             "mol_processed": str(processed_path),
-            "mol_filtered": str(filtered_path),
             "mol_validated": str(validated_path),
             "total_processed_rows": int(len(mol_processed)),
-            "filtered_smiles": int(len(candidate_set)),
-            "matched_candidates_before_range_filter": matched_before_range,
-            "validated_input_rows": int(len(mol_validated)),
-            "validated_unique_structures": int(len(validated_map)),
-            "matched_validated_rows": int(mol_processed["is_validated"].sum()),
-            "validated_rows_in_plot": int(plot_df["is_validated"].sum()),
+            "336_input_rows": int(len(mol_validated)),
+            "336_matched_rows": int(mol_processed["is_validated"].sum()),
+            "336_rows_in_plot": int(plot_df["is_validated"].sum()),
             "total_points_plotted": int(len(plot_df)),
-            "candidates_plotted": int(plot_df["is_candidate"].sum()),
-            "non_candidates_plotted": int((~plot_df["is_candidate"]).sum()),
+            "background_points_plotted": int((~plot_df["is_validated"]).sum()),
             "dropped_missing_or_out_of_range": int(len(mol_processed) - len(plot_df)),
             "out_png": str(Path(OUT_PNG)),
             "out_svg": str(Path(OUT_SVG)),
+            "out_pdf": str(Path(OUT_PDF)),
         }
     )
 
