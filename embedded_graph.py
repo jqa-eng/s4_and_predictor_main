@@ -1,515 +1,283 @@
 # -*- coding: utf-8 -*-
-"""
-embedded_graph.py
-二维嵌入图（UMAP/t-SNE）+ SI 着色 + 候选星标 + 实验验证分子标注
+"""Draw the molecular embedding with the actual virtual-screening score.
 
-输入：
-- --mol-processed: 完整分子列表（用于计算嵌入与绘制全部散点）
-- --mol-filtered: 筛选通过分子列表（仅用于决定哪些分子标星）
-- --mol-validated: 实验验证分子列表（独立匹配、绘制并标注）
+The original CLI is retained. Its three inputs are the complete predictions,
+the output of mol_filter.py, and the experimentally validated structures.
 
-输出：
-- molecules_2d_embedding.png
-- molecules_2d_embedding.svg
-- molecules_with_SI.csv
+For the 025 set, saved structure-embedding coordinates are reused so that the
+same molecules keep the same positions as in the preceding figure. The cache
+contains only canonical SMILES and x/y; SI, toxicity-derived IC50, and old
+predictions are never used to color or rank points. For another molecule set,
+the script computes a deterministic Morgan-fingerprint t-SNE embedding.
+
+Outputs beside this script:
+    molecules_2d_embedding.png
+    molecules_2d_embedding.svg
+    molecules_with_score.csv
 """
 
 import argparse
 from pathlib import Path
 
+import matplotlib as mpl
 import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
-from matplotlib.lines import Line2D
-from rdkit import Chem
+from rdkit import Chem, DataStructs, RDLogger
+from rdkit.Chem import rdFingerprintGenerator
 
-# ---------------------- 可调参数 ----------------------
-DATA_DIR = Path(".")
 
-TOX_TO_IC50 = {
-    "高毒": 5.0,
-    "中毒": (10 + 75) / 2,
-    "微毒": (75 + 200) / 2,
-    "低毒": 250.0,
-}
+PROJECT_DIR = Path(__file__).resolve().parent
+COORDINATE_CACHE = PROJECT_DIR / "graph" / "embedding_coordinates_025.csv"
+OUT_PNG = PROJECT_DIR / "molecules_2d_embedding.png"
+OUT_SVG = PROJECT_DIR / "molecules_2d_embedding.svg"
+OUT_CSV = PROJECT_DIR / "molecules_with_score.csv"
 
-COLOR_MAP = {
-    "both<5": "#4169e1",
-    "one>5-other<=5": "#78c679",
-    "both5-10": "#ffd000",
-    "one>10-other<5": "#ff7f0e",
-    "both>10": "#ff0000",
-}
+SCORE_COLUMNS = [
+    "sa_score", "similarity_335", "distance_335", "mic_percentile",
+    "sa_percentile", "distance_335_percentile", "total_score", "rank",
+]
 
-POINT_SIZE = 10
-STAR_SIZE = 35
-ALPHA_OTHER = 0.8
-ALPHA_STAR = 0.75
-VALIDATED_COLOR = "#8e44ad"
-VALIDATED_SIZE = 90
-
-FIGSIZE = (10, 8)
-DPI = 180
-OUT_PNG = "molecules_2d_embedding.png"
-OUT_SVG = "molecules_2d_embedding.svg"
-OUT_ENRICHED = "molecules_with_SI.csv"
-# ----------------------------------------------------
-
-plt.rcParams["font.family"] = "sans-serif"
-plt.rcParams["font.sans-serif"] = ["SimHei", "DejaVu Sans", "Arial"]
-plt.rcParams["mathtext.fontset"] = "stix"
-plt.rcParams["axes.unicode_minus"] = False
+mpl.rcParams.update({
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
+    "font.size": 8,
+    "svg.fonttype": "none",
+    "axes.linewidth": 0.7,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+})
+RDLogger.DisableLog("rdApp.*")
 
 
 def read_clean(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, encoding="utf-8-sig")
-    df.columns = [str(c).strip() for c in df.columns]
-    if "smiles" in df.columns:
-        df["smiles"] = df["smiles"].astype(str).str.strip().str.strip('"').str.strip("'")
+    df.columns = [str(name).strip() for name in df.columns]
+    if "smiles" in df:
+        df["smiles"] = df["smiles"].astype("string").str.strip().str.strip('"').str.strip("'")
     return df
 
 
-def canonicalize_smiles(smiles):
-    """返回 RDKit canonical SMILES；非法或空 SMILES 返回 None。"""
-    try:
-        mol = Chem.MolFromSmiles(str(smiles).strip())
-        if mol is None:
-            return None
-        return Chem.MolToSmiles(mol, canonical=True)
-    except Exception:
+def canonicalize_smiles(value):
+    if pd.isna(value):
         return None
+    mol = Chem.MolFromSmiles(str(value))
+    return Chem.MolToSmiles(mol, canonical=True) if mol is not None else None
 
 
-def build_validated_map(mol_validated: pd.DataFrame) -> dict:
-    """建立 canonical SMILES -> label 映射，同结构多标签时保留第一条。"""
-    validated_map = {}
-    for _, row in mol_validated.iterrows():
-        canonical = row["canonical_smiles"]
-        if canonical is None or pd.isna(canonical):
-            print(f"WARNING: validated molecule '{row['label']}' has an invalid SMILES")
-            continue
-
-        label = str(row["label"]).strip()
-        if canonical in validated_map:
-            if label != validated_map[canonical]:
-                print(
-                    "WARNING: multiple validated labels refer to the same structure; "
-                    f"keeping '{validated_map[canonical]}' and ignoring '{label}'"
-                )
-            continue
-        validated_map[canonical] = label
-    return validated_map
+def require_columns(df: pd.DataFrame, columns, source: str):
+    missing = sorted(set(columns) - set(df.columns))
+    if missing:
+        raise ValueError(f"{source} 缺少必要列: {', '.join(missing)}")
 
 
-def warn_unplotted_validated(
-    validated_map: dict,
-    mol_processed: pd.DataFrame,
-    plot_df: pd.DataFrame,
-    embedded_df: pd.DataFrame,
-) -> None:
-    """逐个报告未匹配或未进入最终二维图的验证分子。"""
-    processed_structures = set(mol_processed["canonical_smiles"].dropna())
-    plot_ready_structures = set(plot_df["canonical_smiles"].dropna())
-    embedded_structures = set(embedded_df["canonical_smiles"].dropna())
+def load_inputs(processed_path: Path, filtered_path: Path, validated_path: Path):
+    processed = read_clean(processed_path)
+    filtered = read_clean(filtered_path)
+    validated = read_clean(validated_path)
+    require_columns(processed, ["smiles", "toxicity", "aureus_MIC", "ecoli_MIC"],
+                    str(processed_path))
+    require_columns(filtered, ["smiles", "aureus_MIC", *SCORE_COLUMNS],
+                    str(filtered_path))
+    require_columns(validated, ["label", "smiles"], str(validated_path))
 
-    for canonical, label in validated_map.items():
-        if canonical not in processed_structures:
-            print(f"WARNING: validated molecule '{label}' was not found in mol_processed")
-        elif canonical not in plot_ready_structures:
-            print(
-                f"WARNING: validated molecule '{label}' was matched but excluded "
-                "because required MIC/toxicity data are missing"
-            )
-        elif canonical not in embedded_structures:
-            print(
-                f"WARNING: validated molecule '{label}' was matched but did not receive "
-                "final embedding coordinates"
-            )
+    for df in (processed, filtered, validated):
+        df["canonical_smiles"] = df["smiles"].map(canonicalize_smiles)
+    if processed.canonical_smiles.isna().any():
+        raise ValueError("完整分子列表含无效 SMILES，无法为全部结构生成嵌入坐标")
+    if filtered.canonical_smiles.isna().any():
+        raise ValueError("筛选结果含无效 SMILES")
+    if not processed.canonical_smiles.is_unique or not filtered.canonical_smiles.is_unique:
+        raise ValueError("输入存在重复的 canonical SMILES，无法逐一匹配分数与坐标")
+
+    for column in ["aureus_MIC", "ecoli_MIC"]:
+        processed[column] = pd.to_numeric(processed[column], errors="coerce")
+    for column in ["aureus_MIC", *SCORE_COLUMNS]:
+        filtered[column] = pd.to_numeric(filtered[column], errors="coerce")
+    if filtered[["aureus_MIC", *SCORE_COLUMNS]].isna().any().any():
+        raise ValueError("筛选结果存在缺失或非数值的综合排序字段")
+    if not set(filtered.canonical_smiles).issubset(set(processed.canonical_smiles)):
+        raise ValueError("筛选结果包含不在完整分子列表中的结构")
+
+    expected_score = (filtered.mic_percentile + filtered.sa_percentile
+                      + filtered.distance_335_percentile) / 3
+    if not np.allclose(expected_score, filtered.total_score, atol=1e-8):
+        raise ValueError("total_score 与三项百分位秩的等权平均不一致；请重跑 mol_filter.py")
+    if not np.allclose(1 - filtered.similarity_335, filtered.distance_335,
+                       atol=1e-8):
+        raise ValueError("distance_335 与 1 - similarity_335 不一致")
+    # The exported score is rounded; distinct full-precision scores may look tied.
+    # Keep the rank written by mol_filter.py and check its ordering instead.
+    if (not np.allclose(filtered["rank"], filtered["rank"].astype(int))
+            or filtered["rank"].lt(1).any()
+            or filtered["rank"].gt(len(filtered)).any()):
+        raise ValueError("rank 必须是有效的正整数名次")
+    ordered_by_rank = filtered.sort_values(["rank", "total_score"], kind="mergesort")
+    if np.any(np.diff(ordered_by_rank.total_score.to_numpy()) < -1e-8):
+        raise ValueError("rank 与 total_score 的升序顺序不一致")
+
+    # mol_filter.py retains valid structures with 0 < predicted S. aureus MIC <= 20.
+    expected_screen = processed.aureus_MIC.gt(0) & processed.aureus_MIC.le(20)
+    if set(processed.loc[expected_screen, "canonical_smiles"]) != set(filtered.canonical_smiles):
+        raise ValueError("filtered.csv 与当前预测文件的 MIC 初筛结果不一致；请重跑 mol_filter.py")
+
+    matched_mic = processed[["canonical_smiles", "aureus_MIC"]].merge(
+        filtered[["canonical_smiles", "aureus_MIC"]], on="canonical_smiles",
+        how="inner", validate="one_to_one", suffixes=("_processed", "_filtered"))
+    if not np.allclose(matched_mic.aureus_MIC_processed,
+                       matched_mic.aureus_MIC_filtered, atol=1e-6):
+        raise ValueError("filtered.csv 与当前预测文件中的金黄色葡萄球菌 MIC 不一致")
+
+    if validated.canonical_smiles.isna().any():
+        raise ValueError("实验验证分子文件含无效 SMILES")
+    validated["label"] = validated["label"].astype(str).str.strip()
+    validated = validated.drop_duplicates("canonical_smiles", keep="first")
+    return processed, filtered, validated
 
 
-def safe_div(num: pd.Series, den: pd.Series) -> pd.Series:
-    den = den.replace({0: np.nan})
-    return num / den
+def get_coordinates(processed: pd.DataFrame):
+    """Preserve the prior layout when its coordinate cache matches this set."""
+    if COORDINATE_CACHE.exists():
+        cached = pd.read_csv(COORDINATE_CACHE, encoding="utf-8-sig")
+        require_columns(cached, ["canonical_smiles", "x", "y"],
+                        str(COORDINATE_CACHE))
+        if (cached.canonical_smiles.is_unique
+                and len(cached) == len(processed)
+                and set(cached.canonical_smiles) == set(processed.canonical_smiles)
+                and cached[["x", "y"]].notna().all().all()):
+            xy = processed[["canonical_smiles"]].merge(
+                cached[["canonical_smiles", "x", "y"]],
+                on="canonical_smiles", how="left", validate="one_to_one")
+            return xy[["x", "y"]].to_numpy(), "saved structural embedding"
+        print("WARNING: 保存的坐标与当前分子集合不匹配，改为重新计算 Morgan/t-SNE")
+
+    from sklearn.manifold import TSNE
+
+    fingerprint = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+    features = np.zeros((len(processed), 2048), dtype=np.uint8)
+    for index, smiles in enumerate(processed.smiles):
+        mol = Chem.MolFromSmiles(str(smiles))
+        DataStructs.ConvertToNumpyArray(fingerprint.GetFingerprint(mol), features[index])
+    coords = TSNE(n_components=2, perplexity=min(30, len(features) - 1),
+                  learning_rate="auto", init="pca", random_state=42).fit_transform(features)
+    print("WARNING: 已重新计算嵌入，整体坐标可能不同于以前保存的图")
+    return coords, "new Morgan/t-SNE embedding"
 
 
-def classify(si_sa: float, si_ec: float) -> str:
-    if np.isnan(si_sa) or np.isnan(si_ec):
-        return "both<5"
-    if si_sa > 10 and si_ec > 10:
-        return "both>10"
-    if (si_sa > 10 and si_ec < 5) or (si_ec > 10 and si_sa < 5):
-        return "one>10-other<5"
-    if 5 <= si_sa <= 10 and 5 <= si_ec <= 10:
-        return "both5-10"
-    if (si_sa > 5 and si_ec <= 5) or (si_ec > 5 and si_sa <= 5):
-        return "one>5-other<=5"
-    return "both<5"
+def build_output(processed: pd.DataFrame, filtered: pd.DataFrame,
+                 validated: pd.DataFrame, star_top_n: int):
+    result = processed.merge(filtered[["canonical_smiles", *SCORE_COLUMNS]],
+                             on="canonical_smiles", how="left", validate="one_to_one")
+    result["rank"] = result["rank"].astype("Int64")
+    result["is_candidate"] = result.total_score.notna()
+    ordered = filtered.sort_values(["rank", "total_score"], kind="mergesort")
+    stars = ordered if star_top_n <= 0 else ordered.head(star_top_n)
+    result["is_star"] = result.canonical_smiles.isin(stars.canonical_smiles)
+    validated_map = dict(zip(validated.canonical_smiles, validated.label))
+    result["is_validated"] = result.canonical_smiles.isin(validated_map)
+    result["validated_label"] = result.canonical_smiles.map(validated_map)
+    coords, source = get_coordinates(processed)
+    result[["x", "y"]] = coords
+    columns = ["smiles", "canonical_smiles", "toxicity", "aureus_MIC", "ecoli_MIC",
+               *SCORE_COLUMNS, "is_candidate", "is_star", "is_validated",
+               "validated_label", "x", "y"]
+    return result[columns], source
 
 
-def compute_embedding(plot_df: pd.DataFrame):
-    try:
-        from rdkit import DataStructs
-        from rdkit.Chem import AllChem
+def draw(result: pd.DataFrame, star_top_n: int):
+    norm = Normalize(vmin=0, vmax=1)
+    cmap = mpl.colormaps["viridis"]
+    fig, ax = plt.subplots(figsize=(7.20, 5.55), layout="constrained")
+    outside = result.loc[~result.is_candidate]
+    selected = result.loc[result.is_candidate]
+    stars = result.loc[result.is_star]
+    validated = result.loc[result.is_validated]
 
-        def morgan_fp(smiles: str, n_bits=2048, radius=2):
-            mol = Chem.MolFromSmiles(smiles)
-            if mol is None:
-                return None
-            arr = np.zeros((n_bits,), dtype=np.int8)
-            fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=radius, nBits=n_bits)
-            DataStructs.ConvertToNumpyArray(fp, arr)
-            return arr
+    ax.scatter(outside.x, outside.y, s=8, c="#BFC6CC", alpha=0.60,
+               linewidths=0, rasterized=True, zorder=1)
+    ax.scatter(selected.x, selected.y, s=12, c=selected.total_score,
+               cmap=cmap, norm=norm, alpha=0.82, linewidths=0,
+               rasterized=True, zorder=2)
+    ax.scatter(stars.x, stars.y, s=47, marker="*", c=stars.total_score,
+               cmap=cmap, norm=norm, edgecolors="black", linewidths=0.45,
+               alpha=0.96, zorder=3)
+    if not validated.empty:
+        ax.scatter(validated.x, validated.y, s=125, marker="D",
+                   facecolors="#E05A4F", edgecolors="black", linewidths=1.0,
+                   zorder=5)
+        for _, row in validated.iterrows():
+            ax.annotate(row.validated_label, (row.x, row.y), xytext=(-8, 12),
+                        textcoords="offset points", ha="right", fontsize=8.5,
+                        fontweight="bold", color="#8A2522", zorder=6)
 
-        fps = []
-        keep_idx = []
-        for i, smi in enumerate(plot_df["smiles"].astype(str)):
-            fp = morgan_fp(smi)
-            if fp is not None:
-                fps.append(fp)
-                keep_idx.append(i)
+    ax.set_xlabel("Embedding 1")
+    ax.set_ylabel("Embedding 2")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.spines["left"].set_visible(False)
+    ax.spines["bottom"].set_visible(False)
 
-        if not fps:
-            raise RuntimeError("No valid Morgan fingerprints.")
-
-        features = np.stack(fps, axis=0)
-        emb_df = plot_df.iloc[keep_idx].copy()
-    except Exception:
-        features = plot_df[["aureus_MIC", "ecoli_MIC", "IC50_map", "SI_SA", "SI_EC"]].to_numpy(
-            dtype=float
-        )
-        emb_df = plot_df.copy()
-
-    try:
-        import umap
-
-        metric = "jaccard" if np.issubdtype(features.dtype, np.integer) else "euclidean"
-        reducer = umap.UMAP(
-            n_neighbors=30,
-            min_dist=0.1,
-            metric=metric,
-            random_state=42,
-        )
-        coords = reducer.fit_transform(features)
-    except Exception:
-        from sklearn.manifold import TSNE
-
-        n_samples = len(features)
-        if n_samples < 2:
-            raise ValueError("Not enough samples for dimensionality reduction.")
-        perplexity = min(30, max(5, n_samples - 1))
-        if perplexity >= n_samples:
-            perplexity = max(1, n_samples // 3)
-        coords = TSNE(
-            n_components=2,
-            perplexity=perplexity,
-            learning_rate="auto",
-            init="pca",
-            random_state=42,
-        ).fit_transform(features)
-
-    emb_df["x"] = coords[:, 0]
-    emb_df["y"] = coords[:, 1]
-    return emb_df
+    n_stars = int(result.is_star.sum())
+    diamond_label = "Validated compound"
+    if len(validated) == 1:
+        row = validated.iloc[0]
+        diamond_label = f"Compound {row.validated_label}"
+        if pd.notna(row["rank"]):
+            diamond_label += f" (rank {int(row['rank'])}/{len(selected)})"
+    handles = [
+        Line2D([], [], linestyle="", marker="o", color="#BFC6CC", markersize=5,
+               label=f"Outside MIC screen (n = {len(outside)})"),
+        Line2D([], [], linestyle="", marker="o", color=cmap(0.45), markersize=5,
+               label=f"Passed MIC screen (n = {len(selected)})"),
+        Line2D([], [], linestyle="", marker="*", color=cmap(0.10),
+               markeredgecolor="black", markersize=8,
+               label=f"Top {n_stars} by composite rank"),
+    ]
+    if not validated.empty:
+        handles.append(Line2D([], [], linestyle="", marker="D", color="#E05A4F",
+                              markeredgecolor="black", markersize=6,
+                              label=diamond_label))
+    ax.legend(handles=handles, loc="upper left", fontsize=7.2,
+              frameon=True, edgecolor="#D0D5D9", facecolor="white",
+              framealpha=0.96)
+    colorbar = fig.colorbar(mpl.cm.ScalarMappable(norm=norm, cmap=cmap),
+                            ax=ax, shrink=0.73, pad=0.02, aspect=30)
+    colorbar.set_label("Composite score (lower is better)", fontsize=8)
+    colorbar.ax.tick_params(labelsize=7)
+    fig.savefig(OUT_PNG, dpi=400, bbox_inches="tight")
+    fig.savefig(OUT_SVG, bbox_inches="tight")
+    plt.close(fig)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="绘制二维分子嵌入图")
-    parser.add_argument(
-        "--mol-processed",
-        type=str,
-        default="molecules.csv",
-        help="完整分子列表 CSV 文件路径，用于计算嵌入和绘制全部散点",
-    )
-    parser.add_argument(
-        "--mol-filtered",
-        type=str,
-        default="molecules_final.csv",
-        help="筛选通过分子 CSV 文件路径，用于标星",
-    )
-    parser.add_argument(
-        "--star-top-n",
-        type=int,
-        default=100,
-        help="仅对 mol-filtered 中优先级最高的前 N 个分子标星；<=0 表示全部标星",
-    )
-    parser.add_argument(
-        "--mol-validated",
-        type=str,
-        default="validated_molecules.csv",
-        help="实验验证分子 CSV 文件路径，用于单独突出显示和标注",
-    )
+    parser = argparse.ArgumentParser(description="按综合得分绘制二维分子嵌入图")
+    parser.add_argument("--mol-processed", type=str, default="molecules.csv",
+                        help="完整分子预测结果 CSV")
+    parser.add_argument("--mol-filtered", type=str, default="molecules_final.csv",
+                        help="mol_filter.py 的综合排序结果 CSV")
+    parser.add_argument("--star-top-n", type=int, default=100,
+                        help="标星的综合排序前 N 个分子；<=0 表示全部通过初筛的分子")
+    parser.add_argument("--mol-validated", type=str, default="validated_molecules.csv",
+                        help="待突出显示的实验分子，含 label 与 smiles 两列")
     args = parser.parse_args()
-
-    processed_path = Path(args.mol_processed)
-    filtered_path = Path(args.mol_filtered)
-    validated_path = Path(args.mol_validated)
-
-    mol_processed = read_clean(processed_path)
-    mol_filtered = read_clean(filtered_path)
-    mol_validated = read_clean(validated_path)
-
-    required_processed_columns = ["smiles", "toxicity", "aureus_MIC", "ecoli_MIC"]
-    missing_processed = [c for c in required_processed_columns if c not in mol_processed.columns]
-    if missing_processed:
-        raise ValueError(f"mol-processed 文件缺少必要列: {missing_processed}")
-
-    if "smiles" not in mol_filtered.columns:
-        raise ValueError("mol-filtered 文件缺少必要列: ['smiles']")
-
-    missing_validated = [c for c in ["label", "smiles"] if c not in mol_validated.columns]
-    if missing_validated:
-        raise ValueError(f"mol-validated 文件缺少必要列: {missing_validated}")
-
-    for df in [mol_processed, mol_filtered, mol_validated]:
-        df["canonical_smiles"] = df["smiles"].apply(canonicalize_smiles)
-
-    filtered_smiles_series = mol_filtered["smiles"].astype(str).str.strip()
-    filtered_df = mol_filtered.copy()
-    filtered_df["smiles"] = filtered_smiles_series
-    filtered_df = filtered_df[
-        (filtered_df["smiles"] != "")
-        & (filtered_df["smiles"].str.lower() != "nan")
-    ].copy()
-
-    if args.star_top_n > 0:
-        if "aureus_MIC" in filtered_df.columns:
-            filtered_df["aureus_MIC"] = pd.to_numeric(filtered_df["aureus_MIC"], errors="coerce")
-            filtered_df = filtered_df.sort_values(by="aureus_MIC", ascending=True, na_position="last")
-            star_canonical_smiles = filtered_df["canonical_smiles"].head(args.star_top_n)
-        else:
-            star_canonical_smiles = filtered_df["canonical_smiles"].head(args.star_top_n)
-    else:
-        star_canonical_smiles = filtered_df["canonical_smiles"]
-
-    candidate_set = set(filtered_df["canonical_smiles"].dropna())
-    star_set = set(star_canonical_smiles.dropna())
-    mol_processed["is_candidate"] = mol_processed["canonical_smiles"].isin(candidate_set)
-    mol_processed["is_star"] = mol_processed["canonical_smiles"].isin(star_set)
-
-    validated_map = build_validated_map(mol_validated)
-    mol_processed["is_validated"] = mol_processed["canonical_smiles"].isin(validated_map)
-    mol_processed["validated_label"] = mol_processed["canonical_smiles"].map(validated_map)
-
-    mol_processed["toxicity"] = mol_processed["toxicity"].astype(str).str.strip()
-    for col in ["aureus_MIC", "ecoli_MIC"]:
-        mol_processed[col] = pd.to_numeric(mol_processed[col], errors="coerce")
-    mol_processed["IC50_map"] = mol_processed["toxicity"].map(TOX_TO_IC50).astype(float)
-
-    plot_df = mol_processed.copy()
-    plot_df["smiles"] = plot_df["smiles"].astype(str).str.strip()
-    plot_df = plot_df[
-        (plot_df["smiles"] != "")
-        & (plot_df["smiles"].str.lower() != "nan")
-    ].copy()
-    plot_df = plot_df.dropna(subset=["aureus_MIC", "ecoli_MIC", "IC50_map"]).copy()
-
-    plot_df["SI_SA"] = safe_div(plot_df["IC50_map"], plot_df["aureus_MIC"])
-    plot_df["SI_EC"] = safe_div(plot_df["IC50_map"], plot_df["ecoli_MIC"])
-    plot_df["cls"] = [classify(a, b) for a, b in zip(plot_df["SI_SA"], plot_df["SI_EC"])]
-
-    embedded_df = compute_embedding(plot_df)
-    warn_unplotted_validated(validated_map, mol_processed, plot_df, embedded_df)
-
-    plt.close("all")
-    fig, ax = plt.subplots(figsize=FIGSIZE, dpi=DPI)
-
-    for key, color in COLOR_MAP.items():
-        sub = embedded_df[
-            (embedded_df["cls"] == key)
-            & (~embedded_df["is_star"])
-            & (~embedded_df["is_validated"])
-        ]
-        if len(sub) == 0:
-            continue
-        ax.scatter(
-            sub["x"],
-            sub["y"],
-            s=POINT_SIZE,
-            c=color,
-            alpha=ALPHA_OTHER,
-            edgecolors="none",
-            label=None,
-        )
-
-    star = embedded_df[embedded_df["is_star"] & ~embedded_df["is_validated"]]
-    if len(star) > 0:
-        ax.scatter(
-            star["x"],
-            star["y"],
-            s=STAR_SIZE,
-            marker="*",
-            c=COLOR_MAP["both>10"],
-            edgecolors="k",
-            linewidths=0.4,
-            alpha=ALPHA_STAR,
-            label=None,
-        )
-
-    validated = embedded_df[embedded_df["is_validated"]]
-    if len(validated) > 0:
-        ax.scatter(
-            validated["x"],
-            validated["y"],
-            s=VALIDATED_SIZE,
-            marker="D",
-            c=VALIDATED_COLOR,
-            edgecolors="black",
-            linewidths=1.0,
-            alpha=1.0,
-            zorder=10,
-            label=None,
-        )
-        for _, row in validated.iterrows():
-            ax.annotate(
-                str(row["validated_label"]),
-                (row["x"], row["y"]),
-                xytext=(6, 6),
-                textcoords="offset points",
-                fontsize=9,
-                color="black",
-                zorder=11,
-            )
-
-    ax.set_xticks([])
-    ax.set_yticks([])
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-
-    color_handles = [
-        Line2D(
-            [0],
-            [0],
-            marker="o",
-            linestyle="",
-            markerfacecolor=COLOR_MAP["both<5"],
-            markeredgecolor="none",
-            markersize=8,
-            label="SI$_{S.aureus}$<5, SI$_{E.coli}$<5",
-        ),
-        Line2D(
-            [0],
-            [0],
-            marker="o",
-            linestyle="",
-            markerfacecolor=COLOR_MAP["one>5-other<=5"],
-            markeredgecolor="none",
-            markersize=8,
-            label="SI$_{S.aureus}$>5 或 SI$_{E.coli}$>5",
-        ),
-        Line2D(
-            [0],
-            [0],
-            marker="o",
-            linestyle="",
-            markerfacecolor=COLOR_MAP["both5-10"],
-            markeredgecolor="none",
-            markersize=8,
-            label="5≤SI<10（两菌）",
-        ),
-        Line2D(
-            [0],
-            [0],
-            marker="o",
-            linestyle="",
-            markerfacecolor=COLOR_MAP["one>10-other<5"],
-            markeredgecolor="none",
-            markersize=8,
-            label="SI>10 且另一菌<5",
-        ),
-        Line2D(
-            [0],
-            [0],
-            marker="o",
-            linestyle="",
-            markerfacecolor=COLOR_MAP["both>10"],
-            markeredgecolor="none",
-            markersize=8,
-            label="SI>10（两菌）",
-        ),
-    ]
-    shape_handles = [
-        Line2D(
-            [0],
-            [0],
-            marker="*",
-            linestyle="",
-            markerfacecolor=COLOR_MAP["both>10"],
-            markeredgecolor="k",
-            markersize=10,
-            label="候选（星标）",
-        ),
-        Line2D(
-            [0],
-            [0],
-            marker="D",
-            linestyle="",
-            markerfacecolor=VALIDATED_COLOR,
-            markeredgecolor="black",
-            markersize=8,
-            label="实验验证分子",
-        ),
-    ]
-    handles = color_handles + shape_handles
-    legend = ax.legend(
-        handles=handles,
-        title="图例：颜色=SI 等级；★=计算候选；◆=实验验证分子",
-        loc="upper left",
-        bbox_to_anchor=(0.02, 0.98),
-        frameon=True,
-        borderaxespad=0.4,
-        borderpad=0.4,
-        handletextpad=0.6,
-        labelspacing=0.6,
-    )
-    legend._legend_box.align = "left"
-
-    fig.tight_layout()
-    fig.savefig(DATA_DIR / OUT_PNG, bbox_inches="tight", pad_inches=0.2)
-    fig.savefig(DATA_DIR / OUT_SVG, bbox_inches="tight", pad_inches=0.2)
-
-    desired_columns = [
-        "smiles",
-        "canonical_smiles",
-        "toxicity",
-        "aureus_MIC",
-        "ecoli_MIC",
-        "IC50_map",
-        "SI_SA",
-        "SI_EC",
-        "cls",
-        "is_candidate",
-        "is_star",
-        "is_validated",
-        "validated_label",
-        "x",
-        "y",
-    ]
-    existing_columns = [c for c in desired_columns if c in embedded_df.columns]
-    extra_columns = [c for c in embedded_df.columns if c not in existing_columns]
-    embedded_df = embedded_df[existing_columns + extra_columns]
-    embedded_df.to_csv(DATA_DIR / OUT_ENRICHED, index=False, encoding="utf-8-sig")
-
-    print(
-        {
-            "mol_processed": str(processed_path),
-            "mol_filtered": str(filtered_path),
-            "mol_validated": str(validated_path),
-            "total_processed_rows": int(len(mol_processed)),
-            "filtered_smiles": int(len(candidate_set)),
-            "star_top_n": int(args.star_top_n),
-            "star_smiles_used": int(len(star_set)),
-            "matched_star_rows": int(mol_processed["is_star"].sum()),
-            "validated_input_rows": int(len(mol_validated)),
-            "validated_unique_structures": int(len(validated_map)),
-            "matched_validated_rows": int(mol_processed["is_validated"].sum()),
-            "validated_rows_in_plot": int(embedded_df["is_validated"].sum()),
-            "embedded_rows": int(len(embedded_df)),
-            "star_rows_in_plot": int(embedded_df["is_star"].sum()),
-            "out_png": OUT_PNG,
-            "out_svg": OUT_SVG,
-            "out_csv": OUT_ENRICHED,
-        }
-    )
+    processed, filtered, validated = load_inputs(
+        Path(args.mol_processed), Path(args.mol_filtered), Path(args.mol_validated))
+    output, embedding_source = build_output(processed, filtered, validated,
+                                            args.star_top_n)
+    output.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
+    draw(output, args.star_top_n)
+    print({
+        "total_molecules": len(output),
+        "screened_molecules": int(output.is_candidate.sum()),
+        "starred_molecules": int(output.is_star.sum()),
+        "validated_matches": int(output.is_validated.sum()),
+        "embedding_source": embedding_source,
+        "out_png": str(OUT_PNG),
+        "out_svg": str(OUT_SVG),
+        "out_csv": str(OUT_CSV),
+    })
 
 
 if __name__ == "__main__":

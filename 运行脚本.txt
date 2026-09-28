@@ -19,7 +19,7 @@ ecoli_MIC回归模型训练脚本
 python train_classifier.py --train datasets/standard_datasets/toxicity_datasets/toxicity_train.csv --val datasets/standard_datasets/toxicity_datasets/toxicity_val.csv --test datasets/standard_datasets/toxicity_datasets/toxicity_test.csv --task toxicity --feat-start 2 --feat-count 4274 --output-dir models_predicter/toxicity_classifier_4274d/
 细胞毒性分类模型的训练脚本
 
-python train_aureus_regresser_fixed.py --train datasets/standard_datasets/aureus_merged_datasets/aureus_train.csv --val datasets/standard_datasets/aureus_merged_datasets/aureus_val.csv --test datasets/standard_datasets/aureus_merged_datasets/aureus_test.csv --output-dir models_predicter/aureus_regresser_merged/
+python train_aureus_regresser_fixed.py --train datasets/standard_datasets/aureus_random_mic_datasets/aureus_train.csv --val datasets/standard_datasets/aureus_random_mic_datasets/aureus_val.csv --test datasets/standard_datasets/aureus_random_mic_datasets/aureus_test.csv --output-dir models_predicter/aureus_regresser_test/
 aureus回归模型（新旧数据混合）训练脚本
 
 
@@ -50,11 +50,11 @@ python run_rl_linear.py --base-model models_s4/025 --output-dir reinforced_s4_li
 python log_and_split_aureus.py --input datasets/standard_datasets/aureus_merged.csv --output_dir datasets/standard_datasets/aureus_merged_datasets/
 将新增加的数据合并到原先的aureus数据中，计算对数值并进行数据划分
 
-python mol_filter.py --input molecules/molecules_025_2/molecules.csv --output molecules/molecules_025_2/filtered.csv
-仅根据aureus_MIC是否小于20作为唯一筛选的依据
+python mol_filter.py --input molecules/molecules_025/molecules.csv --output molecules/molecules_025/filtered.csv
+仅根据aureus_MIC是否小于20作为唯一筛选的依据，结合SA，相似度排序
 
-python cubic_graph.py --mol-processed molecules/molecules_025_2/molecules.csv --mol-filtered molecules/molecules_025_2/filtered.csv --mol-validated molecules/result/validated_molecules.csv
-绘制立体图，标出所有符合候选条件的分子
+python cubic_graph.py --mol-processed molecules/molecules_025/molecules.csv --mol-filtered molecules/molecules_025/filtered.csv --mol-validated molecules/result/validated_molecules.csv
+绘制立体图，标出所有符合筛选条件的分子，五角星标出前100候选分子
 
-python embedded_graph.py --mol-processed molecules/molecules_025_2/molecules.csv --mol-filtered molecules/molecules_025_2/filtered.csv --mol-validated molecules/result/validated_molecules.csv
-绘制嵌入图，UMAP，标出前100小的aureus_MIC
+python embedded_graph.py --mol-processed molecules/molecules_025/molecules.csv --mol-filtered molecules/molecules_025/filtered.csv --mol-validated molecules/result/validated_molecules.csv
+绘制嵌入图，UMAP，标出前100排名的候选分子
